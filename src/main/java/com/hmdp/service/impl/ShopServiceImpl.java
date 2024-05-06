@@ -2,16 +2,18 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSON;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnels;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.hmdp.utils.CacheClient;
-import com.hmdp.utils.RedisConstants;
-import com.hmdp.utils.RedisData;
+import com.hmdp.utils.*;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -19,11 +21,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import  com.hmdp.utils.RedisConstants;
+
+import javax.annotation.PostConstruct;
 
 import static com.hmdp.utils.RedisConstants.*;
 
@@ -36,13 +41,29 @@ import static com.hmdp.utils.RedisConstants.*;
  * @since 2021-12-22
  */
 @Service
+@Slf4j
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
-
     @Autowired
     private CacheClient cacheClient;
+
+    public BloomFilter<Long> integerBloomFilter;
+
+    @PostConstruct
+    public void init() {
+
+        List<Shop> list = list();
+        integerBloomFilter = BloomFilter.create(Funnels.longFunnel(), list.size(), 0.01);
+
+        list.forEach(shop -> {
+                    integerBloomFilter.put(shop.getId());
+                }
+        );
+        log.info("布隆过滤器初始化成功");
+    }
+
     /**
      * 根据id查询商铺信息
      * @param id
@@ -50,19 +71,42 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
      */
     @Override
     public Result queryById(Long id) {
+
+        if (integerBloomFilter != null) {
+            if (!integerBloomFilter.mightContain(id)) {
+                System.out.println("从布隆过滤器中检测到该key不存在");
+                return Result.fail("无该店铺");
+            }
+        }
+        String key = CACHE_SHOP_KEY + id;
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (json != null) {
+            System.out.println("直接从Redis中返回数据");
+            return Result.ok(JSONUtil.toBean(json,Shop.class));
+        }
+
+        System.out.println("从DB查询数据");
+        Shop shop = getById(id);
+        if (shop != null) {
+            System.out.println("将Db数据放入到Redis中");
+            stringRedisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shop),CACHE_NULL_TTL,TimeUnit.MINUTES);
+        }
+        return Result.ok(shop);
+
         //缓存穿透代码
 //      Shop shop = queryWithPassThrough(id);
-        Shop shop = cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+//        Shop shop = cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+
         //互斥解决缓存击穿
 //        Shop shop = queryWithMutex(id);
 
         //逻辑过期解决缓存击穿
 //        Shop shop = queryWithLogicalExpire(id);
-        Shop shop1 = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY,id,Shop.class,this::getById,CACHE_SHOP_TTL, TimeUnit.MINUTES);
-        if (shop == null){
-            return Result.fail("店铺不存在");
-        }
-        return Result.ok(shop);
+//        Shop shop1 = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY,id,Shop.class,this::getById,CACHE_SHOP_TTL, TimeUnit.MINUTES);
+//        if (shop == null){
+//            return Result.fail("店铺不存在");
+//        }
+//        return Result.ok(shop);
     }
 
     private  static final ExecutorService Cache_Rebuild_Excutor = Executors.newFixedThreadPool(10);
